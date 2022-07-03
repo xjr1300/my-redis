@@ -23,16 +23,36 @@
 //! 言い換えれば、`Bytes`インスタンスに対して`clone()`を呼び出すことは、基礎データをコピーしない。
 //! 代わりに、`Bytes`インスタンスは任意の基礎データへの参照カウンターのハンドルである。
 //! 大まかに言えば、`Bytes`型はArc<Vec<u8>>`だが、いくつかの追加の能力がある。
-//! 
+//!
 //! `bytes`に依存するために、以下を`Cargo.toml`の`[dependencies]`セクションに追加する。
-//! 
+//!
 //! ```toml
 //! bytes = "1"
 //! ```
-//! 
-//! 
+//! ## `HashMap`の初期化
+//!
+//! `HashMap`は多くのタスクや洗剤液に多くのスレッド間で共有される。
+//! これを支援するために、`HashMap`を`Arc<Mutex<_>>`内にラップする。
+//!
+//! まず、利便性のために、`use`文の後に以下の型エイリアスを追加する。
+//!
+//! ```rust
+//! use std::collections::HashMap;
+//! use std::sync::{Arc, Mutex};
+//!
+//! use byes::Bytes;
+//!
+//! type Db = Arc<Mutex<HashMap<String, Bytes>>>;
+//! ```
+//!
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
 use mini_redis::{Connection, Frame, Result};
 use tokio::net::{TcpListener, TcpStream};
+
+type DB = Arc<Mutex<HashMap<String, Bytes>>>;
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
