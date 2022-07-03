@@ -31,7 +31,7 @@
 //! ```
 //! ## `HashMap`の初期化
 //!
-//! `HashMap`は多くのタスクや洗剤液に多くのスレッド間で共有される。
+//! `HashMap`は多くのタスクやおそらく多くのスレッド間で共有される。
 //! これを支援するために、`HashMap`を`Arc<Mutex<_>>`内にラップする。
 //!
 //! まず、利便性のために、`use`文の後に以下の型エイリアスを追加する。
@@ -45,6 +45,26 @@
 //! type Db = Arc<Mutex<HashMap<String, Bytes>>>;
 //! ```
 //!
+//! その次に、`HashMap`を初期化して`process`関数に`Arc`ハンドルを渡すために、main
+//! 関数を更新する。`Arc`を使用することは、おそらく多くのスレッドで実行されている複数のタスクから
+//! 並行的に`HashMap`を参照することが可能になる。Tokioにおいて、任意の共有状態へのアクセスを提供
+//! する値を参照するために**ハンドル**(ここでは、`Arc<Mutex<_>>`)という用語が使用されている。
+//!
+//! ### `std:;sync::Mutex`の使用
+//!
+//! ここで、`tokio::sync::Mutex`ではなく`std::sync::Mutex`が`HashMap`をガードするために使用
+//! されている。非同期のコードの中で、無条件に`tokio::sync::Mutex`を使用することはよくある誤りである。
+//! 非同期ミューテックスは、`.await`呼び出し間でロックされるミューテックスである。
+//!
+//! ロックを獲得するために待っているとき、同期ミューテックスはカレントスレッドをブロックする。
+//! これにより、他のタスクの処理がブロックされる。しかしながら、非同期ミューテックスは内部で同期ミューテックスを
+//! 使用するため、`tokio::sync::Mutex`に切り替えることを、通常役に立たない。
+//!
+//! 経験則として、非同期コードで同期ミューテックスを使用することは、競合が少なく`.await`呼び出し間でロックを
+//! 保持しない限り、問題ない。加えて、`std::sync::Mutex`の高速な互換として
+//! [parking_log::Mutex](https://docs.rs/parking_lot/0.10.2/parking_lot/type.Mutex.html)の使用を
+//! 検討してもよい。
+//!
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -52,19 +72,25 @@ use bytes::Bytes;
 use mini_redis::{Connection, Frame, Result};
 use tokio::net::{TcpListener, TcpStream};
 
-type DB = Arc<Mutex<HashMap<String, Bytes>>>;
+type Db = Arc<Mutex<HashMap<String, Bytes>>>;
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
     // リスナーをアドレスにバインドする。
     let listener = TcpListener::bind("localhost:6379").await.unwrap();
 
+    println!("リスニングしています...");
+
+    let db = Arc::new(Mutex::new(HashMap::new()));
+
     loop {
         let (socket, _) = listener.accept().await.unwrap();
-        // 入ってくるソケットそれぞれについて新しいタスクを生成する。
-        // ソケットは新しいタスクにムーブされて、そこで処理される。
+        // ハッシュマップへのハンドラをクローン
+        let db = db.clone();
+
+        println!("受信しました。");
         tokio::spawn(async move {
-            process(socket).await;
+            process(socket, db).await;
         });
     }
 }
