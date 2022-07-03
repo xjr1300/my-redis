@@ -28,7 +28,8 @@ async fn main() {
     // });
     let _ = task::spawn(async move {
         println!("vecはここ: {:?}", v);
-    }).await;
+    })
+    .await;
 }
 
 /*
