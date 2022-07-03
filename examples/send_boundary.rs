@@ -37,11 +37,11 @@ async fn main() {
 //         // コンパイルできる。
 //         // use std::sync::Arc;
 //         // let rc = Arc::new("hello");
-// 
+//
 //         // `rc`が`.await`の後で使用される。
 //         // `.await`の後で使用されるものは、タスクの状態として存続される必要がある。
 //         yield_now().await;
-// 
+//
 //         println!("{}", rc);
 //     });
 // }
