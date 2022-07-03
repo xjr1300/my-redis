@@ -117,6 +117,141 @@
 //! 一度作成されると、シャードの数を変更することができない。
 //! [dashmap](https://docs.rs/dashmap)クレートは、より洗練された共有されたハッシュマップの
 //! 実装を提供する。
+//!
+//! ## `.await`間の`MutexGuard`の保持
+//!
+//! このように見えるコードを記述するかもしれない。
+//!
+//! ```rust
+//! use std::sync::{Mutex, MUtexGuard};
+//!
+//! async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
+//!     let mut lock: MutexGuard<i32> = mutex.lock().unwrap();
+//!     *lock += 1;
+//!
+//!     do_something_async().await;
+//! }   // ここでロックはスコープ外になる。
+//!
+//! この関数を呼び出す何かを生成することを試みた場合、以下のエラーメッセージに遭遇するだろう。
+//!
+//! error: future cannot be sent between threads safely
+//!    --> src/lib.rs:13:5
+//!    |
+//! 13  |     tokio::spawn(async move {
+//!    |     ^^^^^^^^^^^^ future created by async block is not `Send`
+//!    |
+//!   ::: /playground/.cargo/registry/src/github.com-1ecc6299db9ec823/tokio-0.2.21/src/task/spawn.rs:127:21
+//!    |
+//! 127 |         T: Future + Send + 'static,
+//!    |                     ---- required by this bound in `tokio::task::spawn::spawn`
+//!    |
+//!    = help: within `impl std::future::Future`, the trait `std::marker::Send` is not implemented for `std::sync::MutexGuard<'_, i32>`
+//! note: future is not `Send` as this value is used across an await
+//!   --> src/lib.rs:7:5
+//!    |
+//! 4   |     let mut lock: MutexGuard<i32> = mutex.lock().unwrap();
+//!    |         -------- has type `std::sync::MutexGuard<'_, i32>` which is not `Send`
+//! ...
+//! 7   |     do_something_async().await;
+//!    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^ await occurs here, with `mut lock` maybe used later
+//! 8   | }
+//!    | - `mut lock` is later dropped here
+//!
+//! これは、`std::sync::MutexGuard`型が`Send`出ないことが理由で発生する。
+//! これは、他のスレッドにミューテックスを送信できないことを意味しており、そのエラーはTokioランタイムが
+//! すべての`.await`でスレッド間にタスクをムーブできることが理由で発生する。
+//! これを避けるために、むテックスロックが`.await`の前に破壊されるようなコードに再構成する必要がある。
+//!
+//! ```rust
+//! // これは動作する!
+//! async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
+//!     {
+//!         let mut lock: MutexGuard<i32> = mutex.lock().unwrap();
+//!         *lock += 1;
+//!     }   // ここでロックがスコープ外になる。
+//!
+//!     do_something_async().await;
+//! }
+//!
+//! 以下は動作しないことに注意しなさい。
+//!
+//! ```rust
+//! use std::sync::{Mutex, MutexGuard};
+//!
+//! // これも失敗する。
+//! async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
+//!     let mut lock: MutexGuard<i32> = mutex.lock().unwrap();
+//!     *lock += 1;
+//!     drop(lock);
+//!
+//!     do_something_async().await;
+//! }
+//!
+//! これは、現在コンパイラがスコープの情報のみに基づいてフューチャーが`Send`であるかどうかを計算する
+//! ことが理由である。うまくいけば、将来、コンパイラは明示的なドロップを支援するために更新されるが、
+//! 現在では、明示的にスコープを使用する必要がある。
+//!
+//! ここで議論したエラーは、[Send bound section from the spawning](https://tokio.rs/tokio/tutorial/spawning#send-bound)
+//! の章でも議論されている。
+//!
+//! `Send`であることを要求しない方法でタスクを生成することによって、この問題を回避することを試みるべきではない。
+//! なぜなら、タスクがロックを抱えている間、Tokioは`.await`でそのタスクを中断すると、任意の他のタスクは同じスレッ
+//! ドで実行されるようにスケジュールされているかもしれず、そしてこのその他のタスクはそのミューテックスのロックを試み
+//! るかもしれず、ミューテックスをロックするために待っているタスクは、ミューテックスを保持しているタスクがミューテックス
+//! を解放することが妨げられるためデッドロックとなる。
+//!
+//! そのエラーを修正するための手段を以下で議論する。
+//!
+//! ### `.await`間でロックを保持しないようにコードを再構成する
+//!
+//! 上記のスニペットで1つの例を見たが、これをするより強固な方法がいくつかある。
+//! 例えば、構造体の中にミューテックスをラップして、その構造体内の非同期でないメソッドでのみミューテックスのロックを獲得する。
+//!
+//! ```rust
+//! use std::sync::Mutex;
+//!
+//! struct CanIncrement {
+//!     mutex: Mutex<i32>,
+//! }
+//! impl CanIncrement {
+//!     // この関数は非同期でないとマークされている。
+//!     fn increment(&self) {
+//!         let mut lock = self.mutex.lock().unwrap();
+//!         *lock += 1;
+//!     }
+//! }
+//!
+//! async fn increment_and_do_stuff(can_incr: &CanIncrement) {
+//!     can_incr.increment();
+//!     do_something_async().await();
+//! }
+//!
+//! このパターンは、`Send`エラーに陥らないことを保証する。なぜならミューテックスガードが非同期関数内の
+//! どこにも現れないからである。
+//!
+//! ### 状態を管理するタスクを生成して、それで操作するためにメッセージパッシングを使用する
+//!
+//! これは、この章の最初で言及した2番目の手法で、それは共有するリソースがI/Oリソースのときによく使用される。
+//! 詳細は次の章で説明する。
+//!
+//! ### Tokioの非同期ミューテックスを使用する
+//!
+//! Tokioによって提供される`tokio::sync::Mutex`型もまた使用される。
+//! Tokioミューテックスの主要な機能は、問題なしに`.await`間で保持することができることである。
+//! つまり、非同期ミューテックスは普通のミューテックスよりも高価であり、典型的に2つの他の手段のうち1つを
+//! 使用する方が良い。
+//!
+//! ```rust
+//! use tokio::sync::Mutex;     // Tokioのミューテックスを使用していることに注意
+//!
+//! // これはコンパイルできる!
+//! // (しかし、この場合、コードを再構成する方が良いだろう)
+//! async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
+//!     let mut lock = mutex.lock().await;
+//!     *lock += 1;
+//!
+//!     do_something_async().await;
+//! }   // ここでロックはスコープ外になる。
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
