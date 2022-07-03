@@ -252,3 +252,13 @@ async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
 
     do_something_async().await;
 }   // ここでロックはスコープ外になる。
+
+## チャネル
+
+現在、Tokioの並行性について少し学んだので、これをクライアント側に適用する。
+以前に記述したサーバーのコードを明示的なバイナリファイルに入れる。
+
+```shell
+mkdir src/bin
+mv src/main.rs src/bin/server.rs
+```
