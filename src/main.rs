@@ -99,12 +99,8 @@ pub async fn main() -> Result<()> {
 /// 値を蓄積するために`HashMap`を使用する。
 /// `SET`コマンドは`HashMap`の中に値を挿入して、`GET`はそれらを読み出す。
 /// 加えて、接続につき1つのコマンドより多く受け付けるためにループを使用する。
-async fn process(socket: TcpStream) {
+async fn process(socket: TcpStream, db: Db) {
     use mini_redis::Command::{self, Get, Set};
-    use std::collections::HashMap;
-
-    // データを蓄積するために`HashMap`を使用する。
-    let mut db = HashMap::new();
 
     // `mini-redis`が提供する`Connection`はソケットから来るフレームを解析処理する。
     let mut connection = Connection::new(socket);
@@ -113,16 +109,14 @@ async fn process(socket: TcpStream) {
     while let Some(frame) = connection.read_frame().await.unwrap() {
         let response = match Command::from_frame(frame).unwrap() {
             Set(cmd) => {
-                // `Vec<u8>`として値を蓄積する。
-                db.insert(cmd.key().to_string(), cmd.value().to_vec());
+                let mut db = db.lock().unwrap();
+                db.insert(cmd.key().to_string(), cmd.value().clone());
                 Frame::Simple("OK".to_string())
             }
             Get(cmd) => {
+                let db = db.lock().unwrap();
                 if let Some(value) = db.get(cmd.key()) {
-                    // `Frame::Bulk`はデータがBytes`型であることを想定する。
-                    // この型はチュートリアルの後半で説明する。
-                    // 現在のところ、`&Vec<u8>`は`into()`の使用することで`Bytes`に変換される。
-                    Frame::Bulk(value.clone().into())
+                    Frame::Bulk(value.clone())
                 } else {
                     Frame::Null
                 }
