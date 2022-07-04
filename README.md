@@ -47,7 +47,7 @@ type Db = Arc<Mutex<HashMap<String, Bytes>>>;
 
 その次に、`HashMap`を初期化して`process`関数に`Arc`ハンドルを渡すために、main
 関数を更新する。`Arc`を使用することは、おそらく多くのスレッドで実行されている複数のタスクから
-並行的に`HashMap`を参照することが可能になる。Tokioにおいて、任意の共有状態へのアクセスを提供
+同時並行的に`HashMap`を参照することが可能になる。Tokioにおいて、任意の共有状態へのアクセスを提供
 する値を参照するために**ハンドル**(ここでは、`Arc<Mutex<_>>`)という用語が使用されている。
 
 #### `std:;sync::Mutex`の使用
@@ -255,7 +255,7 @@ async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
 
 ## チャネル
 
-現在、Tokioの並行性について少し学んだので、これをクライアント側に適用する。
+現在、Tokioの同時並行性について少し学んだので、これをクライアント側に適用する。
 以前に記述したサーバーのコードを明示的なバイナリファイルに入れる。
 
 ```shell
@@ -284,9 +284,9 @@ cargo run --bin client
 
 コードを記述する。
 
-言ってみれば、2つの並行したRedisコマンドを実行する必要がある。
+言ってみれば、2つの同時並行したRedisコマンドを実行する必要がある。
 1つのコマンドにつき1つのタスクを生成できる。
-そして、2つのコマンドは並行で発生するだろう。
+そして、2つのコマンドは同時並行で発生するだろう。
 
 最初に、以下のようなものを試す。
 
@@ -417,7 +417,7 @@ use tokio::sync::mpsc;
 #[tokio::main]
 async fn main() {
     let (tx, mut rx) = mpsc::channel(32);
-    let tx = tx.clone();
+    let tx2 = tx.clone();
 
     tokio::spawn(async move {
         tx.send("sending from first handle").await;
@@ -433,7 +433,7 @@ async fn main() {
 }
 ```
 
-療法のメッセージは`Receiver`ハンドルに送信される。
+両方のメッセージは`Receiver`ハンドルに送信される。
 `mpsc`チャネルの受信者はクローンすることができない。
 
 すべての`Sender`がスコープ外になるか、その他の方法でドロップされた時、チャネルにそれ以上メッセージを
@@ -443,3 +443,231 @@ async fn main() {
 
 Redisコネクションを管理するタスクの場合、一旦、Redisコネクションが閉じられたら、チャネルが閉られて、
 再度接続を使用できないことを知る。
+
+### 管理タスクの生成
+
+次に、チャネルからのメッセージを処理するタスクを生成する。
+最初にクライアント接続がRedisに対して確立される。
+そして、Redis接続を介して、受信したコマンドが発行される。
+
+```rust
+use mini_redis::client;
+
+// `ムーブ`キーワードは`rx`の所有権がタスクに**ムーブ**するために使用される。
+let manager = tokio::spawn(async move {
+    // サーバーへの接続を確立する。
+    let mut client = client::connect("localhost:6379").await.unwrap();
+
+    // メッセージの受信を開始する。
+    while let Some(cmd) = rx.recv().await {
+        use Command::*;
+
+        match cmd {
+            Get { key } => {
+                client.get(&key).await;
+            },
+            Set {
+                key, val,
+            } => {
+                client.set(&key, val).await;
+            }
+        }
+    }
+});
+```
+
+現在、直接Redisに接続して発行する代わりに、2つのタスクはチャネルを介してコマンドを送信するように
+更新する。
+
+```rust
+// `送信者`ハンドルはタスク内にムーブされた。2つのタスクがあるため、2番目の`送信者`が必要である。
+let tx2 = tx.clone();
+
+// 2つのタスクを生成して、1つはキーを取得して、その他はキーを設定する。
+let t1 = tokio::spawn(async move {
+    let cmd = Command::Get {
+        key: "hello".to_string(),
+    };
+
+    tx.send(cmd).await.unwrap();
+});
+
+let t2 = tokio::spawn(async move {
+    let cmd = Command::Set {
+        key: "foo".to_string(),
+        value: "bar".into(),
+    };
+
+    tx2.send(cmd).await.unwrap();
+});
+```
+
+`main`関数の下の方で、プロセスが終了する前にコマンドが完全に完了したことを保証するためにジョイン
+ハンドルを`.await`する。
+
+```rust
+t1.await.unwrap();
+t2.await.unwrap();
+manager.await.unwrap();
+```
+
+### 応答の受信
+
+最後のステップは、管理タスクから戻ってくる応答を受信することである。
+`GET`コマンドは値を取得する必要があり、`SET`コマンドは操作が成功で完了したかを知る必要がある。
+
+応答を渡すために、`oneshot`チャネルが使用される。
+`oneshot`チャネルは、1つの値を送信するために最適化された単独の生産者、単独の消費者チャネルである。
+本件の場合、1つの値が応答である。
+
+`mpsc`と同様に、`oneshot::chanel()`は送信者と受信者のハンドルを返却する。
+
+```rust
+use tokio::sync::oneshot;
+
+let (tx, rx) = oneshot::channel();
+```
+
+`mpsc`と似ておらず、容量は常に1つであるため、容量を指定しない。
+加えて、どちらのハンドルもクローンされない。
+
+管理タスクから応答を受信するために、コマンドを送信する前に、`oneshot`チャネルが作成される。
+チャネルの半分を使用する送信者は管理タスクへのコマンドに含まれている。
+チャネルの半分は応答を受信するっために使用される。
+
+最初に、`送信者を`含めるために`Command`を更新する。
+利便性のために、型エイリアスが`送信者`を参照するために使用される。
+
+```rust
+use tokio::sync::oneshot;
+use bytes::Bytes;
+
+// 複数の異なるコマンドは1つのチャネルに多重化される。
+#[derive(Debug)]
+enum Command {
+    Get {
+        key: String,
+        response: Responder<Option<Bytes>>,
+    },
+    Set {
+        key: STring,
+        value: Bytes,
+        response: Responder<()>,
+    },
+}
+
+// 要求者によって提供され、管理タスクによって使用される、要求者に返却されるコマンドの応答
+type Responder<T> = oneshot::Sender<mini_redis::Result<T>>;
+```
+
+現在、`oneshot::Sender`を含むためにコマンドを発行するタスクを更新する。
+
+```rust
+let t1 = tokio::spawn(async move {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let cmd = Command::Get {
+        key: "hello".to_string(),
+        resp: resp_tx,
+    };
+
+    // GETリクエストを送信する。
+    tx.send(cmd).await.unwrap();
+
+    // 応答を待つ。
+    let res = resp_rx.await;
+    println!("GOT = {:?}", res); 
+});
+
+let t2 = tokio::spawn(async move {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let cmd = Command::Set {
+        key: "foo".to_string(),
+        val: "bar".into(),
+        resp: resp_tx,
+    };
+
+    // SETリクエストを送信する。
+    tx2.send(cmd).await.unwrap();
+
+    // 応答を待つ。
+    let res = resp_rx.await;
+    println!("GOT = {:?}", res);
+});
+```
+
+最後に、`oneshot`チャネルを介して、応答を送信するために管理タスクを更新する。
+
+```rust
+while let Some(cmd) = rx.recv().await {
+    match cmd {
+        Command::Get { key, resp } => {
+            let res = client.get(&key).await;
+            // エラーを無視する。
+            let _ = resp.send(res);
+        },
+        Command::Set { key, val, resp } => {
+            let res = client.set(&key, val).await;
+            // エラーを無視する。
+            let _ = resp.send(res);
+        }
+    }
+}
+```
+
+`oneshot::Sender`の`send`の呼び出しはすぐに完了して、`.await`を必要としない。
+これは、`oneshot`チャネルの`send`は、何らかまつ形式なしで、常に失敗するかすぐに成功するかであるためである。
+
+チャネルの半分の受信者がドロップされたとき、`oneshot`チャネルで値を送信することは`Err`を返却する。
+これは受信者が応答に脅威がないことを意味する。
+本件のシナリオにおいて、受信者が興味をキャンセルすることは許容できるイベントである。
+`resp.send(...)`によって返却される`Err`は処理されることを必要としていない。
+
+全体のコードを[ここ](https://github.com/tokio-rs/website/blob/master/tutorial-code/channels/src/main.rs)で見つけることができる。
+
+### バックプレッシャーとチャネルの制限
+
+バックプレッシャーとは、半二重接続のネットワーク機器などで用いられるフロー制御方式で、
+受信側が記憶装置の容量の飽和を防ぐために、わざと送信側の送信動作を妨害する。
+
+同時並行性またはキューイングが導入されるときはいつでも、キューイングが拘束されて、システムが優雅に負荷を処理することを保証することが重要である。
+制限されていないキューは最終的にすべての利用できるメモリをいっぱいにして、予期しない方法でシステムの停止を発生させる。
+
+Tokioは暗黙的なキューイングを避けることに注意する。
+この大きな部分は、非同期操作が遅延される事実である。
+以下を考慮しなさい。
+
+```rust
+loop {
+    async_op();
+}
+```
+
+非同期操作が貪欲に実行される場合、そのループは前の操作が完了したことを確信することなしに、繰り返し新しい`async_op`をキューする。
+この結果は暗黙的な制限のないキューイングである。
+コールバックに基づくシステムと`熱心な`フューチャーに基づくシステムは、特にこの影響を受けやすい。
+
+しかしながら、Tokioと非同期Rustでは、上記のスニペットは`async_op`を全く実行せずに結果を得られない。
+これは、`.await`が呼ばれていないことが理由である。
+スニペットが`update`を使用するように変更された場合、そのループは最初からやり直す前に、操作の完了を待機する。
+
+```rust
+loop {
+    // `async_op`が完了するまで繰り返しをしない。
+    async_op().await;
+}
+```
+
+同時並行性とキューイングは明治的に導入されるべきである。
+これを行う方法は次の通りである。
+
+* `tokio::spawn`
+* `select!`
+* `join!`
+* `mps::channel`
+
+そうしたとき、同時並行の全体量が制限されるように保証するように注意しなければならない。
+例えば、TCP受信ループを記述しているとき、開いているソケットの全体数が制限されるように保証しなければならない。
+`mpsc::channel`を使用しているとき、管理できるチャネル容量を選択しなければならない。
+明確な制限数はアプリケーション固有である。
+
+良い制限を注意して選択することは、信頼できるTokioアプリケーションを記述する部分の大半を占める。
