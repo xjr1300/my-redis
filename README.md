@@ -262,3 +262,119 @@ async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
 mkdir src/bin
 mv src/main.rs src/bin/server.rs
 ```
+
+そして、クライアントコードを含める予定の新しいバイナリファイルを作成する。
+
+```shell
+touch src/bin/client.rs
+```
+
+このファイル内に、この章のコードを記述する。
+それを実行する必要があるとき、最初にサーバーを分離したターミナルウィンドウで起動する必要がある。
+
+```shell
+cargo run --bin server
+```
+
+そして、クライアントを、他のターミナルで実行する。
+
+```shell
+cargo run --bin client
+```
+
+コードを記述する。
+
+言ってみれば、2つの並行したRedisコマンドを実行する必要がある。
+1つのコマンドにつき1つのタスクを生成できる。
+そして、2つのコマンドは並行で発生するだろう。
+
+最初に、以下のようなものを試す。
+
+```rust
+use mini_redis::client;
+
+#[tokio::main]
+async fn main() {
+    // サーバーとの接続を確立する。
+    let mut client = client::connect("127.0.0.1:6379").await.unwrap();
+
+    // 2つのタスクを生成して、1つはキーを取得して、その他はキーを設定する。
+    let t1 = tokio::spawn(async {
+        let res = client.get("hello").await;
+    });
+
+    let t2 = tokio::spawn(async {
+        client.set("foo", "bar".into()).await;
+    })
+
+    t1.await.unwrap();
+    t2.await.unwrap();
+}
+```
+
+両方のタスクはなんとかして`client`にアクセスする必要があるためコンパイルできない。
+`Client`は`Copy`を実装していないため、この共有を容易にするためのコードがないとコンパイルできない。
+加えて、`Client::set`は`&mut self`を受け取り、それはそれを呼ぶために排他的なアクセスを要求する
+ことを意味する。
+タスクごとに接続を開くことができるが、それは理想的ではない。
+ロックを保持して`.await`を呼び出す必要があるため、`std::sync::Mutex`を使用することはできない。
+`tokio::sync::Mutex`を使用できるが、それは1つのリクエストしか許可しない。
+クライアントが[パイプライン](https://redis.io/topics/pipelining)を実装している場合、
+非同期ミューテックスは、十分に活用されない結果になる。
+
+### メッセージパッシング
+
+その答えはメッセージパッシングを使用することである。
+そのパターンは`client`のリソースを管理する献身的なタスクの生成を巻き込む。
+リクエストを発行したい任意のガス区は`client`タスクにメッセージを送信する。
+`client`タスクは送信者に代わってリクエストを発行して、応答が送信者に返送される。
+
+この戦略を使用することで、1つの接続が確立される。
+`client`を管理するタスクは、`get`と`set`を呼び出すために排他的なアクセスを取得できる。
+加えて、チャネルはバッファとして機能する。
+`client`タスクが忙しい間も、操作が`client`タスクに送信されるだろう。
+一旦、`client`タスクが新しいリクエストを処理できるようになれば、それはチャネルから次のリクエスト
+を引き出す。
+これは良いスループットをもたらし、接続プーリングをサポートするように拡張できる。
+
+### Tokioのチャネル基本要素
+
+Tokioは[いくつかのチャネル](https://docs.rs/tokio/1/tokio/sync/index.html)を提供しており、
+それぞれ別の目的を提供している。
+
+* [mpsc](https://docs.rs/tokio/1/tokio/sync/mpsc/index.html): 複数の生産者、単独の消費者チャネル。多くの値が送信される。
+* [oneshot](https://docs.rs/tokio/1/tokio/sync/oneshot/index.html): 単独の生産者、単独の消費者チャネル。1つの値が送信される。
+* [broadcast](https://docs.rs/tokio/1/tokio/sync/broadcast/index.html): 複数の生産者、複数の消費者。多くの値が送信される。各受信者はすべての値を見る。
+* [watch](https://docs.rs/tokio/1/tokio/sync/watch/index.html): 単独の生産者、複数の消費者。多くの値が送信されるが、履歴を保持しない。受信者は最も最新の値のみ見る。
+
+1つの消費者が各メッセージを見る複数の生産者、複数の消費者チャネルが必要な場合、[async-channel](https://docs.rs/async-channel/)
+クレートを使用できる。
+[std::sync::mpsc](https://doc.rust-lang.org/stable/std/sync/mpsc/index.html)や
+[crossbeam::channel](https://docs.rs/crossbeam/latest/crossbeam/channel/index.html)のような、
+非同期Rustの外部で使用するためのチャネルがある。
+これらのチャネルはスレッドをブロックすることによってメッセージを待ち受け、それは非同期コードを許可しない。
+
+この節では、`mpsc`と`oneshot`を使用する。
+メッセージパッシングチャネルのその他の型は、後の節で探求される。
+この節の完全なコードは[ここ](https://github.com/tokio-rs/website/blob/master/tutorial-code/channels/src/main.rs)で見つかる。
+
+### メッセージ型の定義
+
+ほとんどの場合、メッセージパッシングを使用するとき、メッセージを受け取っているタスクは1つのコマンドより多く応答する。
+本件の場合、タスクは`GET`と`SET`コマンドに応答する。
+これを構成するために、最初に`Command`列挙型を定義して、それぞれのコマンドの種類にバリアントを含める。
+
+```rust
+use bytes::Bytes;
+
+#[derive(Debug)]
+enum Command {
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: Bytes,
+    }
+}
+```
