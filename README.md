@@ -378,3 +378,68 @@ enum Command {
     }
 }
 ```
+
+### チャネルの作成
+
+`main`関数内に、`mpsc`チャネルを構築する。
+
+```rust
+use tokio::sync::mpsc;
+
+#[tokio::main]
+async fn main() {
+    // 最大32個までの容量を持つ新しいチャネルを作成する。
+    // tx: 送信: Transmitter
+    // rx: 受信: Receiver
+    // 末尾の`x`は「省略」を示す文字という説と、e`X`changeの略という説がある。
+    let (tx, mut rx) = mpsc::channel(32);
+
+    // ...残りはここにくる。
+}
+```
+
+`mpsc`チャネルはコマンドをRedisコネクションを管理するタスクに`send`するために使用される。
+複数の生産者の能力は多くのタスクからメッセージを送信されることを許可する。
+チャネルを作成すると送信者と受信者の2つの値が返却される。
+その2つのハンドルは分離して使用される。
+それらは異なるタスクにムーブされる。
+
+そのチャネルは32個の容量で作成される。
+メッセージがそれらが受け取るよりも早く送信されると、チャネルはそれらを蓄積する。
+一旦、チャネル内に32個のメッセージが蓄積されると、`send(...).await`の呼び出しは、
+受信者によってメッセージが取り除かれるまでスリープする。
+
+複数のタスクから送信することは、`Sender`の`cloning`によってなされる。
+
+```rust
+use tokio::sync::mpsc;
+
+#[tokio::main]
+async fn main() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let tx = tx.clone();
+
+    tokio::spawn(async move {
+        tx.send("sending from first handle").await;
+    });
+
+    tokio::spawn(async move {
+        tx2.send("sending from second handle").await;
+    });
+
+    while let Some(message) = rx.recv().await {
+        println!("GOT = {}", message);
+    }
+}
+```
+
+療法のメッセージは`Receiver`ハンドルに送信される。
+`mpsc`チャネルの受信者はクローンすることができない。
+
+すべての`Sender`がスコープ外になるか、その他の方法でドロップされた時、チャネルにそれ以上メッセージを
+送信することができなくなる。
+この点において、`Receiver`への`recv`呼び出しは`None`を返却して、これはすべての送信者がいなくなり、
+チャネルが閉じられたことを意味する。
+
+Redisコネクションを管理するタスクの場合、一旦、Redisコネクションが閉じられたら、チャネルが閉られて、
+再度接続を使用できないことを知る。
